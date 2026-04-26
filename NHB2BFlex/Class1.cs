@@ -23,10 +23,18 @@ namespace NHB2BFlex
             var db = doc.Database;
             var ed = doc.Editor;
 
-            // --- Step 1: select objects, keep only block references ---
+            ed.WriteMessage("\n========== NHB2BFlex Command Started ==========");
+            ed.WriteMessage("\n--- STEP 1: Select Front Blocks ---");
+            ed.WriteMessage("\nPlease select all FRONT blocks (multiple instances of the SAME type).");
+            ed.WriteMessage("\nNote: All selected blocks must be of the same block type.");
+
+            // --- Step 1: select Front blocks, keep only block references ---
             var psr = ed.GetSelection();
             if (psr.Status != PromptStatus.OK)
+            {
+                ed.WriteMessage("\nCancelled by user.");
                 return;
+            }
 
             var blockIds = new List<ObjectId>();
             using (var tr = db.TransactionManager.StartTransaction())
@@ -45,14 +53,17 @@ namespace NHB2BFlex
             if (blockIds.Count == 0)
             {
                 ed.WriteMessage("\nNo block references found in selection.");
+                ed.WriteMessage("\nPlease select only block references (not other objects).");
                 return;
             }
 
-            ed.WriteMessage($"\n{blockIds.Count} block reference(s) selected.");
+            ed.WriteMessage($"\n✓ {blockIds.Count} block reference(s) selected.");
 
-            // --- Step 2: group source blocks by effective name and collect their data ---
-            // Key = effective block name, Value = list of source block data
-            var groupedSources = new Dictionary<string, List<SourceBlockData>>(StringComparer.OrdinalIgnoreCase);
+            // --- Step 2: validate that all Front blocks are of the same type ---
+            string frontBlockType = null;
+            var frontBlocksData = new List<SourceBlockData>();
+
+            ed.WriteMessage("\n--- Validating Front Block Types ---");
 
             using (var tr = db.TransactionManager.StartTransaction())
             {
@@ -61,6 +72,20 @@ namespace NHB2BFlex
                     var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
                     string name = GetBlockEffectiveName(tr, br);
 
+                    if (frontBlockType == null)
+                    {
+                        frontBlockType = name;
+                        ed.WriteMessage($"\nDetected block type: \"{frontBlockType}\"");
+                    }
+                    else if (!string.Equals(frontBlockType, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ed.WriteMessage($"\n✗ Error: Selected blocks are of different types!");
+                        ed.WriteMessage($"   - First block type: \"{frontBlockType}\"");
+                        ed.WriteMessage($"   - This block type: \"{name}\"");
+                        ed.WriteMessage($"\n  Please select Front blocks of only ONE type and try again.");
+                        return;
+                    }
+
                     var data = new SourceBlockData
                     {
                         SourceId = id,
@@ -68,122 +93,90 @@ namespace NHB2BFlex
                         DynamicProps = CollectDynamicPropertyValues(br)
                     };
 
-                    if (!groupedSources.ContainsKey(name))
-                        groupedSources[name] = new List<SourceBlockData>();
-                    groupedSources[name].Add(data);
+                    frontBlocksData.Add(data);
                 }
                 tr.Commit();
             }
 
-            // --- Step 3: select allowed template blocks (both source-type and -Z) ---
-            ed.WriteMessage("\nSelect allowed template blocks (include both e.g. \"P-1\" and \"P-1-Z\"): ");
-            var psrTemplates = ed.GetSelection();
-            if (psrTemplates.Status != PromptStatus.OK)
+            ed.WriteMessage($"\n✓ All {blockIds.Count} selected blocks are of type: \"{frontBlockType}\"");
+
+            // --- Step 3: select the PI (Production Instruction) block ---
+            ed.WriteMessage("\n--- STEP 2: Select the PI Block ---");
+            ed.WriteMessage("\nPlease select the PI (Production Instruction) block to use as a template.");
+            ed.WriteMessage("\nThis is the block where you want attributes/properties to be copied from.");
+
+            var peoPi = new PromptEntityOptions("\nSelect PI block: ");
+            peoPi.SetRejectMessage("✗ Only block references are allowed. Please select a block.");
+            peoPi.AddAllowedClass(typeof(BlockReference), exactMatch: false);
+
+            var perPi = ed.GetEntity(peoPi);
+            if (perPi.Status != PromptStatus.OK)
             {
-                ed.WriteMessage("\nCancelled. Aborting.");
+                ed.WriteMessage("\n✗ Cancelled by user.");
                 return;
             }
 
-            // Key = block name, Value = first ObjectId seen for that name
-            var allowedPool = new Dictionary<string, ObjectId>(StringComparer.OrdinalIgnoreCase);
+            ed.WriteMessage($"\n✓ PI block selected.");
+
+            // --- Step 4: validate that PI block's attributes/props are contained in Front block's attributes/props ---
+            ed.WriteMessage("\n--- Validating PI Block Compatibility ---");
+
+            var piAttributes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var piDynamicProps = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                foreach (var selObj in psrTemplates.Value)
-                {
-                    var so = (SelectedObject)selObj;
-                    if (!so.ObjectId.IsValid) continue;
-                    var br = tr.GetObject(so.ObjectId, OpenMode.ForRead) as BlockReference;
-                    if (br == null) continue;
-                    string name = GetBlockEffectiveName(tr, br);
-                    if (!allowedPool.ContainsKey(name))
-                        allowedPool[name] = so.ObjectId;
-                }
+                var piBlock = (BlockReference)tr.GetObject(perPi.ObjectId, OpenMode.ForRead);
+                piAttributes = CollectAttributeValues(tr, piBlock);
+                piDynamicProps = CollectDynamicPropertyValues(piBlock);
                 tr.Commit();
             }
 
-            // --- Step 3b: resolve valid pairs and validate compatibility ---
-            // Key = source block name, Value = ObjectId of the -Z template block reference
-            var templateIds = new Dictionary<string, ObjectId>(StringComparer.OrdinalIgnoreCase);
+            // Check that PI block attributes/props are contained in Front block's attributes/props
+            var sampleFrontBlock = frontBlocksData[0];
+            var frontAttrNames = new HashSet<string>(sampleFrontBlock.Attributes.Keys, StringComparer.OrdinalIgnoreCase);
+            var frontPropNames = new HashSet<string>(sampleFrontBlock.DynamicProps.Keys, StringComparer.OrdinalIgnoreCase);
 
-            foreach (var name in groupedSources.Keys.OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
+            var piAttrNames = new HashSet<string>(piAttributes.Keys, StringComparer.OrdinalIgnoreCase);
+            var piPropNames = new HashSet<string>(piDynamicProps.Keys, StringComparer.OrdinalIgnoreCase);
+
+            var piAttrNamesForCompare = new HashSet<string>(piAttrNames, StringComparer.OrdinalIgnoreCase);
+            piAttrNamesForCompare.Remove(QuantityTag);
+
+            // Check if PI block attributes/props are a subset of Front block attributes/props
+            var missingAttrs = piAttrNamesForCompare.Except(frontAttrNames, StringComparer.OrdinalIgnoreCase).ToList();
+            var missingProps = piPropNames.Except(frontPropNames, StringComparer.OrdinalIgnoreCase).ToList();
+
+            if (missingAttrs.Count > 0 || missingProps.Count > 0)
             {
-                string zName = $"{name}-Z";
-
-                bool hasSrc = allowedPool.ContainsKey(name);
-                bool hasZ = allowedPool.ContainsKey(zName);
-
-                if (!hasSrc || !hasZ)
-                {
-                    if (!hasSrc && !hasZ)
-                        ed.WriteMessage($"\nNo template blocks found for \"{name}\" (missing \"{name}\" and \"{zName}\") — skipping.");
-                    else if (!hasSrc)
-                        ed.WriteMessage($"\nNo template block found for \"{name}\" (missing \"{name}\") — skipping.");
-                    else
-                        ed.WriteMessage($"\nNo template block found for \"{name}\" (missing \"{zName}\") — skipping.");
-                    continue;
-                }
-
-                using (var tr = db.TransactionManager.StartTransaction())
-                {
-                    var brZ = (BlockReference)tr.GetObject(allowedPool[zName], OpenMode.ForRead);
-
-                    var sampleSource = groupedSources[name][0];
-                    var srcAttrNames = new HashSet<string>(sampleSource.Attributes.Keys, StringComparer.OrdinalIgnoreCase);
-                    var srcPropNames = new HashSet<string>(sampleSource.DynamicProps.Keys, StringComparer.OrdinalIgnoreCase);
-
-                    var zAttrNames = CollectAttributeNames(tr, brZ);
-                    var zPropNames = CollectDynamicPropertyNames(brZ);
-
-                    var zAttrNamesForCompare = new HashSet<string>(zAttrNames, StringComparer.OrdinalIgnoreCase);
-                    zAttrNamesForCompare.Remove(QuantityTag);
-
-                    if (!srcAttrNames.SetEquals(zAttrNamesForCompare) || !srcPropNames.SetEquals(zPropNames))
-                    {
-                        ed.WriteMessage($"\n\"{name}\" and \"{zName}\" do not have matching attributes/properties — skipping.");
-
-                        var missingInZ = srcAttrNames.Except(zAttrNamesForCompare, StringComparer.OrdinalIgnoreCase).ToList();
-                        var extraInZ = zAttrNamesForCompare.Except(srcAttrNames, StringComparer.OrdinalIgnoreCase).ToList();
-                        var missingPropsInZ = srcPropNames.Except(zPropNames, StringComparer.OrdinalIgnoreCase).ToList();
-                        var extraPropsInZ = zPropNames.Except(srcPropNames, StringComparer.OrdinalIgnoreCase).ToList();
-
-                        if (missingInZ.Count > 0) ed.WriteMessage($"\n  Attributes in \"{name}\" but not in \"{zName}\": {string.Join(", ", missingInZ)}");
-                        if (extraInZ.Count > 0) ed.WriteMessage($"\n  Attributes in \"{zName}\" but not in \"{name}\": {string.Join(", ", extraInZ)}");
-                        if (missingPropsInZ.Count > 0) ed.WriteMessage($"\n  Dynamic props in \"{name}\" but not in \"{zName}\": {string.Join(", ", missingPropsInZ)}");
-                        if (extraPropsInZ.Count > 0) ed.WriteMessage($"\n  Dynamic props in \"{zName}\" but not in \"{name}\": {string.Join(", ", extraPropsInZ)}");
-
-                        tr.Commit();
-                        continue;
-                    }
-
-                    if (!zAttrNames.Contains(QuantityTag))
-                    {
-                        ed.WriteMessage($"\n\"{zName}\" is missing the \"{QuantityTag}\" attribute — skipping.");
-                        tr.Commit();
-                        continue;
-                    }
-
-                    templateIds[name] = allowedPool[zName];
-                    tr.Commit();
-                }
-            }
-
-            if (templateIds.Count == 0)
-            {
-                ed.WriteMessage("\nNo valid block pairs found. Aborting.");
+                ed.WriteMessage($"\n✗ Error: PI block has attributes/properties not found in Front block!");
+                if (missingAttrs.Count > 0) 
+                    ed.WriteMessage($"\n  Attributes in PI but not in Front block: {string.Join(", ", missingAttrs)}");
+                if (missingProps.Count > 0) 
+                    ed.WriteMessage($"\n  Dynamic properties in PI but not in Front block: {string.Join(", ", missingProps)}");
+                ed.WriteMessage($"\nPlease select a compatible PI block and try again.");
                 return;
             }
 
-            // --- Step 3b: select the NET block ---
-            var peoNet = new PromptEntityOptions("\nSelect the NET block: ");
-            peoNet.SetRejectMessage("\nOnly block references are allowed.");
+            ed.WriteMessage($"\n✓ PI block is compatible with Front blocks.");
+
+            // --- Step 5: select the NET block ---
+            ed.WriteMessage("\n--- STEP 3: Select the NET Block ---");
+            ed.WriteMessage("\nPlease select the NET block where the output will be placed.");
+            ed.WriteMessage("\nThis is the grid/container block that will hold the generated blocks.");
+
+            var peoNet = new PromptEntityOptions("\nSelect NET block: ");
+            peoNet.SetRejectMessage("✗ Only block references are allowed. Please select a block.");
             peoNet.AddAllowedClass(typeof(BlockReference), exactMatch: false);
 
             var perNet = ed.GetEntity(peoNet);
             if (perNet.Status != PromptStatus.OK)
             {
-                ed.WriteMessage("\nCancelled. Aborting.");
+                ed.WriteMessage("\n✗ Cancelled by user.");
                 return;
             }
+
+            ed.WriteMessage($"\n✓ NET block selected.");
 
             Point3d netOrigin;
             double cellWidth;
@@ -199,134 +192,149 @@ namespace NHB2BFlex
                 tr.Commit();
             }
 
-            ed.WriteMessage($"\nNET origin: ({netOrigin.X:0.##}, {netOrigin.Y:0.##}), cell size: {cellWidth:0.##} x {cellHeight:0.##}");
+            ed.WriteMessage($"\n✓ NET block dimensions calculated.");
+            ed.WriteMessage($"\n  Grid layout: {ColumnsPerRow} columns");
+            ed.WriteMessage($"  Cell size: {cellWidth:0.##} x {cellHeight:0.##}");
 
-            // --- Step 4: for each group, deduplicate by fingerprint and create -Z blocks ---
+            // --- Step 6: get the PI block template reference ---
+            ObjectId piTemplateId = perPi.ObjectId;
+
+            // --- Step 7: for each Front block, deduplicate by fingerprint and create blocks from PI template ---
+            ed.WriteMessage("\n--- STEP 4: Processing and Generating Blocks ---");
+            ed.WriteMessage($"\nProcessing {frontBlocksData.Count} Front block(s)...");
+
             int cellIndex = 0;
 
-            // KEY = NAME attribute value, VALUE = list of (created -Z ObjectId, source ObjectIds in that fingerprint group)
+            // KEY = NAME attribute value, VALUE = list of (created block ObjectId, source ObjectIds in that fingerprint group)
             // Used after creation to detect NAME conflicts and draw revclouds.
-            var nameToCreated = new Dictionary<string, List<(ObjectId ZBlockId, List<ObjectId> SourceIds)>>(StringComparer.OrdinalIgnoreCase);
+            var nameToCreated = new Dictionary<string, List<(ObjectId CreatedBlockId, List<ObjectId> SourceIds)>>(StringComparer.OrdinalIgnoreCase);
 
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 var ms = (BlockTableRecord)tr.GetObject(
                     SymbolUtilityServices.GetBlockModelSpaceId(db), OpenMode.ForWrite);
 
-                foreach (var kvp in groupedSources.Where(k => templateIds.ContainsKey(k.Key)))
+                var piBlock = (BlockReference)tr.GetObject(piTemplateId, OpenMode.ForRead);
+
+                // Group Front blocks by fingerprint (identical attr+prop values → same generated block with higher Quantity)
+                var fingerGroups = new Dictionary<string, List<SourceBlockData>>(StringComparer.Ordinal);
+                foreach (var src in frontBlocksData)
                 {
-                    string srcName = kvp.Key;
-                    var sources = kvp.Value;
-                    var templateId = templateIds[srcName];
+                    string fp = src.GetFingerprint();
+                    if (!fingerGroups.ContainsKey(fp))
+                        fingerGroups[fp] = new List<SourceBlockData>();
+                    fingerGroups[fp].Add(src);
+                }
 
-                    var templateBr = (BlockReference)tr.GetObject(templateId, OpenMode.ForRead);
+                ed.WriteMessage($"\nFound {fingerGroups.Count} unique block configuration(s) based on attributes.");
 
-                    // Group sources by fingerprint (identical attr+prop values → same -Z block with higher Quantity)
-                    var fingerGroups = new Dictionary<string, List<SourceBlockData>>(StringComparer.Ordinal);
-                    foreach (var src in sources)
+                foreach (var group in fingerGroups.Values)
+                {
+                    int quantity = group.Count;
+                    var representative = group[0];
+
+                    // Calculate grid cell position (center of cell)
+                    int col = cellIndex % ColumnsPerRow;
+                    int row = cellIndex / ColumnsPerRow;
+                    double cellX = netOrigin.X + (col * cellWidth) + (cellWidth / 2.0);
+                    double cellY = netOrigin.Y - (row * cellHeight) - (cellHeight / 2.0);
+                    var cellPos = new Point3d(cellX, cellY, netOrigin.Z);
+                    cellIndex++;
+
+                    // Create new block reference using PI block as template
+                    // Use DynamicBlockTableRecord so dynamic properties are available on the new instance
+                    var btrId = piBlock.IsDynamicBlock
+                        ? piBlock.DynamicBlockTableRecord
+                        : piBlock.BlockTableRecord;
+
+                    var newBr = new BlockReference(cellPos, btrId);
+                    newBr.ScaleFactors = piBlock.ScaleFactors;
+                    newBr.Rotation = piBlock.Rotation;
+                    newBr.Normal = piBlock.Normal;
+
+                    ms.AppendEntity(newBr);
+                    tr.AddNewlyCreatedDBObject(newBr, true);
+
+                    // Add attributes from the BTR definition
+                    var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
+                    foreach (ObjectId entId in btr)
                     {
-                        string fp = src.GetFingerprint();
-                        if (!fingerGroups.ContainsKey(fp))
-                            fingerGroups[fp] = new List<SourceBlockData>();
-                        fingerGroups[fp].Add(src);
+                        var dbObj = tr.GetObject(entId, OpenMode.ForRead);
+                        if (dbObj is AttributeDefinition attDef && !attDef.Constant
+                            && !attDef.Tag.StartsWith(IgnoredAttributePrefix, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var attRef = new AttributeReference();
+                            attRef.SetAttributeFromBlock(attDef, newBr.BlockTransform);
+
+                            if (string.Equals(attDef.Tag, QuantityTag, StringComparison.OrdinalIgnoreCase))
+                            {
+                                attRef.TextString = quantity.ToString();
+                            }
+                            else if (representative.Attributes.TryGetValue(attDef.Tag, out string val))
+                            {
+                                attRef.TextString = val;
+                            }
+                            else if (piAttributes.TryGetValue(attDef.Tag, out string piVal))
+                            {
+                                attRef.TextString = piVal;
+                            }
+
+                            newBr.AttributeCollection.AppendAttribute(attRef);
+                            tr.AddNewlyCreatedDBObject(attRef, true);
+                        }
                     }
 
-                    foreach (var group in fingerGroups.Values)
+                    // Set dynamic properties
+                    if (newBr.IsDynamicBlock)
                     {
-                        int quantity = group.Count;
-                        var representative = group[0];
-
-                        // Calculate grid cell position (center of cell)
-                        int col = cellIndex % ColumnsPerRow;
-                        int row = cellIndex / ColumnsPerRow;
-                        double cellX = netOrigin.X + (col * cellWidth) + (cellWidth / 2.0);
-                        double cellY = netOrigin.Y - (row * cellHeight) - (cellHeight / 2.0);
-                        var cellPos = new Point3d(cellX, cellY, netOrigin.Z);
-                        cellIndex++;
-
-                        // Create new -Z block reference
-                        // Use DynamicBlockTableRecord so dynamic properties are available on the new instance
-                        var btrId = templateBr.IsDynamicBlock
-                            ? templateBr.DynamicBlockTableRecord
-                            : templateBr.BlockTableRecord;
-
-                        var newBr = new BlockReference(cellPos, btrId);
-                        newBr.ScaleFactors = templateBr.ScaleFactors;
-                        newBr.Rotation = templateBr.Rotation;
-                        newBr.Normal = templateBr.Normal;
-
-                        ms.AppendEntity(newBr);
-                        tr.AddNewlyCreatedDBObject(newBr, true);
-
-                        // Add attributes from the BTR definition
-                        var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
-                        foreach (ObjectId entId in btr)
+                        try
                         {
-                            var dbObj = tr.GetObject(entId, OpenMode.ForRead);
-                            if (dbObj is AttributeDefinition attDef && !attDef.Constant
-                                && !attDef.Tag.StartsWith(IgnoredAttributePrefix, StringComparison.OrdinalIgnoreCase))
+                            var dynProps = newBr.DynamicBlockReferencePropertyCollection;
+                            if (dynProps != null)
                             {
-                                var attRef = new AttributeReference();
-                                attRef.SetAttributeFromBlock(attDef, newBr.BlockTransform);
-
-                                if (string.Equals(attDef.Tag, QuantityTag, StringComparison.OrdinalIgnoreCase))
+                                foreach (DynamicBlockReferenceProperty p in dynProps)
                                 {
-                                    attRef.TextString = quantity.ToString();
-                                }
-                                else if (representative.Attributes.TryGetValue(attDef.Tag, out string val))
-                                {
-                                    attRef.TextString = val;
-                                }
-
-                                newBr.AttributeCollection.AppendAttribute(attRef);
-                                tr.AddNewlyCreatedDBObject(attRef, true);
-                            }
-                        }
-
-                        // Set dynamic properties
-                        if (newBr.IsDynamicBlock)
-                        {
-                            try
-                            {
-                                var dynProps = newBr.DynamicBlockReferencePropertyCollection;
-                                if (dynProps != null)
-                                {
-                                    foreach (DynamicBlockReferenceProperty p in dynProps)
+                                    if (p.ReadOnly) continue;
+                                    if (string.Equals(p.PropertyName, "Origin", StringComparison.OrdinalIgnoreCase)) continue;
+                                    if (representative.DynamicProps.TryGetValue(p.PropertyName, out object srcVal))
                                     {
-                                        if (p.ReadOnly) continue;
-                                        if (string.Equals(p.PropertyName, "Origin", StringComparison.OrdinalIgnoreCase)) continue;
-                                        if (representative.DynamicProps.TryGetValue(p.PropertyName, out object srcVal))
-                                        {
-                                            try { p.Value = srcVal; }
-                                            catch { }
-                                        }
+                                        try { p.Value = srcVal; }
+                                        catch { }
+                                    }
+                                    else if (piDynamicProps.TryGetValue(p.PropertyName, out object piVal))
+                                    {
+                                        try { p.Value = piVal; }
+                                        catch { }
                                     }
                                 }
                             }
-                            catch { }
                         }
+                        catch { }
+                    }
 
-                        ed.WriteMessage($"\nCreated \"{srcName}-Z\" (Quantity={quantity}) at cell [{row},{col}] ({cellPos.X:0.##}, {cellPos.Y:0.##})");
+                    ed.WriteMessage($"\n  Created block (Qty={quantity}) at [{row},{col}]");
 
-                        // Track NAME value → created -Z block for conflict detection
-                        if (representative.Attributes.TryGetValue(NameTag, out string nameVal) && !string.IsNullOrWhiteSpace(nameVal))
-                        {
-                            if (!nameToCreated.ContainsKey(nameVal))
-                                nameToCreated[nameVal] = new List<(ObjectId, List<ObjectId>)>();
-                            nameToCreated[nameVal].Add((newBr.ObjectId, group.Select(s => s.SourceId).ToList()));
-                        }
+                    // Track NAME value → created block for conflict detection
+                    if (representative.Attributes.TryGetValue(NameTag, out string nameVal) && !string.IsNullOrWhiteSpace(nameVal))
+                    {
+                        if (!nameToCreated.ContainsKey(nameVal))
+                            nameToCreated[nameVal] = new List<(ObjectId, List<ObjectId>)>();
+                        nameToCreated[nameVal].Add((newBr.ObjectId, group.Select(s => s.SourceId).ToList()));
                     }
                 }
 
                 tr.Commit();
             }
 
-            ed.WriteMessage($"\n{cellIndex} block(s) placed in the NET grid.");
+            ed.WriteMessage($"\n✓ {cellIndex} block(s) generated and placed in the NET grid.");
 
-            // --- Step 5: draw red revclouds around conflicting blocks (same NAME, different values) ---
+            // --- Step 8: draw red revclouds around conflicting blocks (same NAME, different values) ---
             var conflictingNames = nameToCreated.Where(kv => kv.Value.Count > 1).ToList();
             if (conflictingNames.Count > 0)
             {
+                ed.WriteMessage($"\n--- NAME Conflict Detection ---");
+                ed.WriteMessage($"\n⚠ WARNING: Found {conflictingNames.Count} NAME conflict(s):");
+
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
                     var ms = (BlockTableRecord)tr.GetObject(
@@ -337,13 +345,14 @@ namespace NHB2BFlex
                         string nameVal = kv.Key;
                         var entries = kv.Value;
 
-                        ed.WriteMessage($"\nNAME conflict detected for \"{nameVal}\" — {entries.Count} distinct -Z blocks share this name. Drawing revclouds.");
+                        ed.WriteMessage($"\n  • \"{nameVal}\" — {entries.Count} different configurations share this name.");
+                        ed.WriteMessage($"    Drawing red revclouds around conflicting blocks...");
 
-                        // Collect all block IDs that need a revcloud: the -Z blocks + their source blocks
+                        // Collect all block IDs that need a revcloud: the created blocks + their source blocks
                         var allConflictIds = new List<ObjectId>();
-                        foreach (var (zId, srcIds) in entries)
+                        foreach (var (createdId, srcIds) in entries)
                         {
-                            allConflictIds.Add(zId);
+                            allConflictIds.Add(createdId);
                             allConflictIds.AddRange(srcIds);
                         }
 
@@ -364,10 +373,10 @@ namespace NHB2BFlex
                     tr.Commit();
                 }
 
-                ed.WriteMessage($"\nRevclouds drawn for {conflictingNames.Count} conflicting NAME value(s).");
+                ed.WriteMessage($"\n✓ Revclouds drawn for {conflictingNames.Count} conflicting NAME(s).");
             }
 
-            ed.WriteMessage("\n--- NHBlock complete ---\n");
+            ed.WriteMessage("\n========== NHB2BFlex Command Completed Successfully ==========\n");
         }
 
         #region Data Classes
